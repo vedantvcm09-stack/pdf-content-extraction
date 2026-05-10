@@ -1,0 +1,11 @@
+docling>=2.0.0
+docling-core>=2.0.0
+
+streamlit>=1.40.0
+pandas>=2.2.0
+
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+
+Pillow>=10.0.0
+numpy>=1.26.0
