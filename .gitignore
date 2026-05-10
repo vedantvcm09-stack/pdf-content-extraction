@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+Test Folder/
+analysis_progress.md
+main_enhanced.py
+.idea/
