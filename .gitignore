@@ -222,3 +222,6 @@ Test Folder/
 analysis_progress.md
 main_enhanced.py
 .idea/
+
+# Local extraction store (created by store.py)
+extractions/
