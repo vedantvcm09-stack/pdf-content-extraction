@@ -19,6 +19,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 
+import store
 from main import (
     parse_pdf,
     preprocess_pdf_orientation,
@@ -35,6 +36,9 @@ from main import (
     extract_best_figure_to_memory,
     merge_and_export,
     export_table_to_csv,
+    render_pdf_pages_as_images,
+    group_figures_by_page,
+    group_tables_by_page,
     DEFAULT_TOP_N,
     DEFAULT_THRESHOLD,
     DEFAULT_IMAGE_SCALE,
@@ -47,7 +51,7 @@ from main import (
 st.set_page_config(
     page_title="PDF Table & Figure Extractor",
     page_icon="📊",
-    layout="centered",
+    layout="wide",
 )
 
 # ---------------------------------------------------------------------------
@@ -169,7 +173,7 @@ query = st.text_input(
     disabled=list_only,
 )
 
-col_csv, col_img = st.columns(2)
+col_csv, col_img, col_split, col_table_split = st.columns(4)
 with col_csv:
     btn_csv = st.button(
         "📥 Get CSV" if not list_only else "📋 List Tables",
@@ -188,6 +192,24 @@ with col_img:
             "With a query: returns the best-matched figure. "
             "Without a query: returns all figures as a ZIP."
         ),
+    )
+
+with col_split:
+    btn_split = st.button(
+        "📄 Split View",
+        type="secondary",
+        disabled=(uploaded_file is None),
+        use_container_width=True,
+        help="Show PDF pages with extracted figures side-by-side.",
+    )
+
+with col_table_split:
+    btn_table_split = st.button(
+        "📊 Table Split View",
+        type="secondary",
+        disabled=(uploaded_file is None),
+        use_container_width=True,
+        help="Show PDF pages with extracted tables side-by-side.",
     )
 
 # ---------------------------------------------------------------------------
@@ -219,6 +241,36 @@ def get_conv_result():
     file_bytes = uploaded_file.read()
     uploaded_file.seek(0)
     return cached_parse(file_bytes, uploaded_file.name, use_ocr, extract_images, image_scale, accurate)
+
+def ensure_registered(conv_result=None) -> str:
+    """Register the currently uploaded PDF in the persistent store and return pdf_id."""
+    file_bytes = uploaded_file.getvalue()
+    page_count = 0
+    if conv_result is not None:
+        try:
+            page_count = len(getattr(conv_result.document, "pages", []) or [])
+        except Exception:
+            page_count = 0
+    manifest = store.register_pdf(file_bytes, uploaded_file.name, page_count=page_count)
+    return manifest["pdf_id"]
+
+def _pic_page(conv_result, pic_idx: int) -> int:
+    try:
+        pic = conv_result.document.pictures[pic_idx]
+        if pic.prov:
+            return pic.prov[0].page_no
+    except Exception:
+        pass
+    return 0
+
+def _table_page(conv_result, table_idx: int) -> int:
+    try:
+        tbl = conv_result.document.tables[table_idx]
+        if tbl.prov:
+            return tbl.prov[0].page_no
+    except Exception:
+        pass
+    return 0
 
 # ---------------------------------------------------------------------------
 # ACTION: Get Image
@@ -294,6 +346,20 @@ if btn_img and uploaded_file is not None:
         best_caption = result.get("caption") or result.get("nearest_text") or ""
         st.image(result["png_bytes"], caption=best_caption or None, use_container_width=True)
 
+        # Persist to library
+        try:
+            pdf_id = ensure_registered(conv_result)
+            saved_name = store.save_image(
+                pdf_id,
+                result["png_bytes"],
+                idx=result["pic_idx"] + 1,
+                page=_pic_page(conv_result, result["pic_idx"]),
+                caption=best_caption,
+            )
+            st.caption(f"💾 Saved to library as `{saved_name}`")
+        except Exception as _e:
+            st.warning(f"Library save failed: {_e}")
+
         q_slug = re.sub(r"[^\w]+", "_", query.strip()[:40]).strip("_")
         file_name = f"{pdf_stem}-figure-{result['pic_idx'] + 1}-{q_slug}.png"
 
@@ -322,6 +388,22 @@ if btn_img and uploaded_file is not None:
         st.success(f"Found **{n_figs} figure{'s' if n_figs != 1 else ''}** in this PDF.")
 
         ctx_map = {c["pic_idx"]: c for c in fig_contexts}
+
+        # Persist all figures to the library
+        try:
+            pdf_id = ensure_registered(conv_result)
+            for i, (_fname, png_bytes) in enumerate(figures):
+                cap = ctx_map.get(i, {}).get("caption", "") or ctx_map.get(i, {}).get("nearest_text", "")
+                store.save_image(
+                    pdf_id,
+                    png_bytes,
+                    idx=i + 1,
+                    page=_pic_page(conv_result, i),
+                    caption=cap,
+                )
+            st.caption(f"💾 Saved {n_figs} figures to library.")
+        except Exception as _e:
+            st.warning(f"Library save failed: {_e}")
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -361,6 +443,185 @@ if btn_img and uploaded_file is not None:
                 )
 
     st.stop()
+
+# ---------------------------------------------------------------------------
+# ACTION: Split View
+# ---------------------------------------------------------------------------
+
+if btn_split and uploaded_file is not None:
+
+    if not extract_images:
+        st.warning(
+            "**'Extract images' is OFF in the sidebar.** "
+            "Enable it and click **Split View** again — Docling needs to "
+            "render figure bounding boxes at parse time."
+        )
+        st.stop()
+
+    with st.spinner(f"Parsing PDF with Docling at image scale {image_scale:.1f}..."):
+        try:
+            conv_result, tmp_path = get_conv_result()
+        except Exception as e:
+            st.error(f"Docling failed to parse the PDF: {e}")
+            st.stop()
+
+    n_pics = len(conv_result.document.pictures)
+
+    if n_pics == 0:
+        st.error(
+            "No figures were detected in this PDF.\n\n"
+            "Possible reasons: text-only document, or figures use vector "
+            "drawing commands that Docling could not isolate as PictureItems."
+        )
+        st.stop()
+
+    with st.spinner("Rendering PDF pages and grouping figures..."):
+        try:
+            # Render PDF pages as images
+            page_images = render_pdf_pages_as_images(tmp_path, scale=2.0)
+            
+            # Group figures by page
+            page_figures = group_figures_by_page(conv_result)
+        except Exception as e:
+            st.error(f"Failed to render PDF pages or group figures: {e}")
+            st.stop()
+
+    # Filter to only pages that have extracted figures
+    pages_with_figures = [(pn, pi) for pn, pi in page_images if page_figures.get(pn)]
+
+    st.success(
+        f"Found **{n_pics} figures** across **{len(pages_with_figures)} page(s)** "
+        f"(of {len(page_images)} total)."
+    )
+    st.divider()
+
+    if not pages_with_figures:
+        st.info("No pages with extracted figures to display.")
+        st.stop()
+
+    # Display each page with its figures in split view
+    for page_num, pil_page in pages_with_figures:
+        st.subheader(f"📄 Page {page_num}")
+        
+        # Create split layout
+        col_page, col_figs = st.columns([1, 1])
+        
+        with col_page:
+            st.markdown("**PDF Page**")
+            buf = io.BytesIO()
+            pil_page.save(buf, format="PNG")
+            buf.seek(0)
+            st.image(buf, use_container_width=True)
+        
+        with col_figs:
+            st.markdown("**Extracted Figures**")
+            figures_on_page = page_figures.get(page_num, [])
+            for pic_idx, pil_fig, caption in figures_on_page:
+                fig_buf = io.BytesIO()
+                pil_fig.save(fig_buf, format="PNG")
+                png_bytes = fig_buf.getvalue()
+                st.image(png_bytes, caption=caption or f"Figure {pic_idx + 1}", use_container_width=True)
+                try:
+                    pdf_id = ensure_registered(conv_result)
+                    store.save_image(pdf_id, png_bytes, idx=pic_idx + 1, page=page_num, caption=caption)
+                except Exception:
+                    pass
+        
+        st.divider()
+
+    st.success("Split view complete!")
+
+# ---------------------------------------------------------------------------
+# ACTION: Table Split View
+# ---------------------------------------------------------------------------
+
+if btn_table_split and uploaded_file is not None:
+
+    with st.spinner("Parsing PDF with Docling..."):
+        try:
+            conv_result, tmp_path = get_conv_result()
+        except Exception as e:
+            st.error(f"Docling failed to parse the PDF: {e}")
+            st.stop()
+
+    n_tables = len(conv_result.document.tables)
+
+    if n_tables == 0:
+        st.error("No tables were detected in this PDF.")
+        if not use_ocr:
+            st.info("For scanned PDFs enable **OCR** in the sidebar and try again.")
+        st.stop()
+
+    with st.spinner("Rendering PDF pages and grouping tables..."):
+        try:
+            # Render PDF pages as images
+            page_images = render_pdf_pages_as_images(tmp_path, scale=2.0)
+            
+            # Group tables by page
+            page_tables = group_tables_by_page(conv_result)
+        except Exception as e:
+            st.error(f"Failed to render PDF pages or group tables: {e}")
+            st.stop()
+
+    # Filter to only pages that have extracted tables
+    pages_with_tables = [(pn, pi) for pn, pi in page_images if page_tables.get(pn)]
+
+    st.success(
+        f"Found **{n_tables} tables** across **{len(pages_with_tables)} page(s)** "
+        f"(of {len(page_images)} total)."
+    )
+    st.divider()
+
+    if not pages_with_tables:
+        st.info("No pages with extracted tables to display.")
+        st.stop()
+
+    # Display each page with its tables in split view
+    for page_num, pil_page in pages_with_tables:
+        st.subheader(f"📄 Page {page_num}")
+        
+        # Create split layout
+        col_page, col_tables = st.columns([1, 1])
+        
+        with col_page:
+            st.markdown("**PDF Page**")
+            buf = io.BytesIO()
+            pil_page.save(buf, format="PNG")
+            buf.seek(0)
+            st.image(buf, use_container_width=True)
+        
+        with col_tables:
+            st.markdown("**Extracted Tables**")
+            tables_on_page = page_tables.get(page_num, [])
+            for table_idx, table_item, table_context in tables_on_page:
+                with st.expander(f"Table {table_idx + 1}", expanded=True):
+                    if table_context:
+                        st.markdown(f"**Section header:** {table_context['section_header'] or '_none_'}")
+                        st.markdown(f"**Nearest text:** {table_context['nearest_text'] or '_none_'}")
+                    
+                    try:
+                        temp_output_path = str(Path(tempfile.gettempdir()) / f"temp_table_{table_idx}.csv")
+                        df = export_table_to_csv(conv_result, table_idx, temp_output_path)
+                        st.dataframe(df, use_container_width=True)
+                        st.caption(f"{df.shape[0]} rows × {df.shape[1]} columns")
+                        try:
+                            pdf_id = ensure_registered(conv_result)
+                            store.save_table(
+                                pdf_id,
+                                df,
+                                idx=table_idx + 1,
+                                page=page_num,
+                                section_header=(table_context or {}).get("section_header", ""),
+                                nearest_text=(table_context or {}).get("nearest_text", ""),
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        st.error(f"Failed to render table: {e}")
+        
+        st.divider()
+
+    st.success("Table split view complete!")
 
 # ---------------------------------------------------------------------------
 # ACTION: Get CSV / List Tables
@@ -480,6 +741,21 @@ if btn_csv and uploaded_file is not None:
     st.subheader("📄 Extracted Table")
     st.dataframe(result_df, use_container_width=True)
     st.caption(f"{result_df.shape[0]} rows × {result_df.shape[1]} columns")
+
+    # Persist to library
+    try:
+        pdf_id = ensure_registered(conv_result)
+        saved_name = store.save_table(
+            pdf_id,
+            result_df,
+            idx=best_ctx["table_idx"] + 1,
+            page=_table_page(conv_result, best_ctx["table_idx"]),
+            section_header=best_ctx.get("section_header", ""),
+            nearest_text=best_ctx.get("nearest_text", ""),
+        )
+        st.caption(f"💾 Saved to library as `{saved_name}`")
+    except Exception as _e:
+        st.warning(f"Library save failed: {_e}")
 
     csv_buffer = io.BytesIO()
     result_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")

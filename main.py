@@ -15,6 +15,7 @@ import pymupdf
 import pdfplumber
 import tempfile
 from pathlib import Path
+from PIL import Image
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
@@ -646,6 +647,33 @@ def _detect_header_row_count(raw_rows: list[list[str]]) -> int:
             break
 
     return max(1, count)
+
+def _grid_header_row_count(table_item) -> int:
+
+    grid = getattr(getattr(table_item, "data", None), "grid", None)
+    if not grid:
+        return 0
+
+    max_header_row_excl = 0
+    saw_flag = False
+    for row in grid:
+        for cell in row:
+            if not getattr(cell, "column_header", False):
+                continue
+            saw_flag = True
+            end_row = getattr(cell, "end_row_offset_idx", None)
+            start_row = getattr(cell, "start_row_offset_idx", None)
+            if end_row is not None:
+                # end_row_offset_idx is exclusive in Docling's convention
+                max_header_row_excl = max(max_header_row_excl, int(end_row))
+            elif start_row is not None:
+                max_header_row_excl = max(max_header_row_excl, int(start_row) + 1)
+
+    if not saw_flag:
+        return 0
+
+    return max(1, min(max_header_row_excl, 4))
+
 
 def _clean_header_piece(value: str) -> str:
     """Normalize header text: collapse whitespace, strip trailing punctuation."""
@@ -1407,23 +1435,30 @@ def _build_enhanced_raw_rows(table_item, doc=None) -> list[list[str]]:
         return geometric_rows
     return offset_rows
 
-def _enhance_raw_table(raw_rows: list[list[str]]) -> pd.DataFrame:
+def _enhance_raw_table(
+    raw_rows: list[list[str]],
+    header_count_hint: int = 0,
+) -> pd.DataFrame:
     if not raw_rows:
         return pd.DataFrame()
 
     num_cols = max(len(row) for row in raw_rows)
     normalized_rows = [row + [""] * (num_cols - len(row)) for row in raw_rows]
-    
-    # Strip leading spanning-title rows (1-2 populated cells, very low numeric)
-    while len(normalized_rows) > 2:
-        row = normalized_rows[0]
-        populated = [str(v).strip() for v in row if str(v).strip()]
-        if len(populated) <= 2 and _numeric_density(populated) < 0.10:
-            normalized_rows = normalized_rows[1:]
-        else:
-            break
 
-    header_count = _detect_header_row_count(normalized_rows)
+    if header_count_hint <= 0:
+        while len(normalized_rows) > 2:
+            row = normalized_rows[0]
+            populated = [str(v).strip() for v in row if str(v).strip()]
+            if len(populated) <= 2 and _numeric_density(populated) < 0.10:
+                normalized_rows = normalized_rows[1:]
+            else:
+                break
+
+
+    if header_count_hint > 0:
+        header_count = min(header_count_hint, max(1, len(normalized_rows) - 1))
+    else:
+        header_count = _detect_header_row_count(normalized_rows)
     headers = _merge_header_rows(normalized_rows[:header_count], num_cols)
 
     data_rows = []
@@ -1487,6 +1522,9 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
     candidates = []
     max_cols = max((len(row) for row in grid), default=0) if grid else 0
 
+
+    grid_header_hint = _grid_header_row_count(table_item)
+
     builders = [
         ("row-first", lambda ti: _build_row_first_raw_rows(ti, doc)),
         ("geometric", _build_geometric_raw_rows),
@@ -1496,7 +1534,7 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
     for label, builder in builders:
         try:
             raw_rows = builder(table_item)
-            enhanced = _enhance_raw_table(raw_rows)
+            enhanced = _enhance_raw_table(raw_rows, header_count_hint=grid_header_hint)
             if enhanced is not None and not enhanced.empty:
                 candidates.append((label, _dataframe_quality_score(enhanced, raw_rows), enhanced))
         except Exception as exc:
@@ -2496,6 +2534,90 @@ def run(
     print(SEP)
 
     return df
+
+# ---------------------------------------------------------------------------
+# 12. Split View Functions
+# ---------------------------------------------------------------------------
+
+def render_pdf_pages_as_images(pdf_path: str, scale: float = 2.0) -> list:
+    """
+    Render all pages of a PDF as images using PyMuPDF.
+    Returns a list of tuples: (page_number, pil_image)
+    """
+    doc = pymupdf.open(pdf_path)
+    page_images = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        # Render page at specified scale
+        mat = pymupdf.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Convert to PIL Image
+        img_data = pix.tobytes("png")
+        pil_img = Image.open(io.BytesIO(img_data))
+        page_images.append((page_num + 1, pil_img))  # 1-based page number
+    
+    doc.close()
+    return page_images
+
+def group_figures_by_page(conv_result) -> dict:
+    """
+    Group extracted figures by their page numbers.
+    Returns a dict: {page_number: [(pic_idx, pil_image, caption), ...]}
+    """
+    pictures = list(conv_result.document.pictures)
+    page_figures = {}
+    
+    for pic_idx, pic in enumerate(pictures):
+        # Get page number from provenance
+        page_no = 0
+        try:
+            if pic.prov:
+                page_no = pic.prov[0].page_no
+        except Exception:
+            page_no = 0
+        
+        # Render the picture
+        pil_img = _render_picture(pic, conv_result)
+        if pil_img is None:
+            continue
+        
+        # Get caption from the picture item if available
+        caption = getattr(pic, "text", "") or ""
+        
+        if page_no not in page_figures:
+            page_figures[page_no] = []
+        page_figures[page_no].append((pic_idx, pil_img, caption))
+    
+    return page_figures
+
+def group_tables_by_page(conv_result) -> dict:
+    """
+    Group extracted tables by their page numbers.
+    Returns a dict: {page_number: [(table_idx, table_item, context), ...]}
+    """
+    tables = list(conv_result.document.tables)
+    page_tables = {}
+    all_items = build_all_items(conv_result)
+    contexts = extract_table_contexts(conv_result, all_items)
+    contexts_by_idx = {ctx["table_idx"]: ctx for ctx in contexts}
+    
+    for table_idx, table in enumerate(tables):
+        page_no = 0
+        try:
+            if table.prov:
+                page_no = table.prov[0].page_no
+        except Exception:
+            page_no = 0
+        
+        table_context = contexts_by_idx.get(table_idx)
+        
+        if page_no not in page_tables:
+            page_tables[page_no] = []
+        page_tables[page_no].append((table_idx, table, table_context))
+    
+    return page_tables
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
