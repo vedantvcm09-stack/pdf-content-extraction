@@ -9,6 +9,7 @@ import argparse
 import tempfile
 from statistics import median
 from pathlib import Path
+from PIL import Image
 
 import pandas as pd
 import pymupdf
@@ -408,6 +409,24 @@ def collapse_to_data_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df.iloc[:, first_data:last_data + 1].copy()
 
+def make_columns_unique(columns):
+
+    seen = {}
+    result = []
+
+    for col in columns:
+
+        col = str(col).strip()
+
+        if col not in seen:
+            seen[col] = 0
+            result.append(col)
+
+        else:
+            seen[col] += 1
+            result.append(f"{col}_{seen[col]}")
+
+    return result
 def _safe_cell_value(value) -> str:
     if value is None:
         return ""
@@ -620,8 +639,14 @@ def _detect_header_row_count(raw_rows: list[list[str]]) -> int:
 
         profile = _row_profile(row)
 
-        # Hard stop: if ANY numeric content exists, this is data, not a header
-        if profile["numeric_cells"] > 0:
+        compact_header_like = _looks_like_compact_header_band(row)
+
+        # Hard stop for numeric data rows.  Multi-row headers may contain
+        # years or units, so low-density numeric text in compact labels can
+        # still be header material.
+        if profile["numeric_cells"] > 0 and not (
+            compact_header_like and profile["numeric_density"] <= 0.35
+        ):
             break
 
         # Hard stop: if the row has substantial populated cells that don't overlap
@@ -640,40 +665,36 @@ def _detect_header_row_count(raw_rows: list[list[str]]) -> int:
             if paren_count / len(non_empty_cells) >= 0.5:
                 is_parenthesized_units = True
 
+        row0_values = [_clean_header_piece(v) for v in raw_rows[0] if str(v).strip()]
+        row0_fills_all = len(row0_values) == len(raw_rows[0])
+        row0_unique_ratio = len({v.lower() for v in row0_values if v}) / max(len(row0_values), 1)
+        unit_or_date_markers = sum(
+            1
+            for value in non_empty_cells
+            if re.search(r"\(|\)|\b\d{4}\b|%", value)
+        )
+        row_is_unit_or_date_band = (
+            non_empty_cells
+            and unit_or_date_markers / len(non_empty_cells) >= 0.50
+        )
+        if (
+            idx == 1
+            and row0_fills_all
+            and row0_unique_ratio >= 0.80
+            and populated == len(row)
+            and _row_overlap_ratio(raw_rows[0], row) < 0.20
+            and not is_parenthesized_units
+            and not row_is_unit_or_date_band
+        ):
+            break
+
         # Only accept as header if it's clearly a compact header band or units
-        if _looks_like_compact_header_band(row) or is_parenthesized_units:
+        if compact_header_like or is_parenthesized_units:
             count = idx + 1
         else:
             break
 
     return max(1, count)
-
-def _grid_header_row_count(table_item) -> int:
-
-    grid = getattr(getattr(table_item, "data", None), "grid", None)
-    if not grid:
-        return 0
-
-    max_header_row_excl = 0
-    saw_flag = False
-    for row in grid:
-        for cell in row:
-            if not getattr(cell, "column_header", False):
-                continue
-            saw_flag = True
-            end_row = getattr(cell, "end_row_offset_idx", None)
-            start_row = getattr(cell, "start_row_offset_idx", None)
-            if end_row is not None:
-                # end_row_offset_idx is exclusive in Docling's convention
-                max_header_row_excl = max(max_header_row_excl, int(end_row))
-            elif start_row is not None:
-                max_header_row_excl = max(max_header_row_excl, int(start_row) + 1)
-
-    if not saw_flag:
-        return 0
-
-    return max(1, min(max_header_row_excl, 4))
-
 
 def _clean_header_piece(value: str) -> str:
     """Normalize header text: collapse whitespace, strip trailing punctuation."""
@@ -721,31 +742,89 @@ def _decorate_duplicate_header_children(headers: list[list[str]]) -> list[list[s
 
 def _fill_header_blanks(headers: list[list[str]]) -> list[list[str]]:
     filled = [row[:] for row in headers]
+
     for row_idx in range(len(filled) - 1):
-        populated = [idx for idx, value in enumerate(filled[row_idx]) if _clean_header_piece(value)]
-        if populated == [0]:
-            continue
+        populated = [
+            idx for idx, value in enumerate(filled[row_idx])
+            if _clean_header_piece(value)
+        ]
+
         carry = ""
+
         for col_idx, value in enumerate(filled[row_idx]):
             value = _clean_header_piece(value)
+
             if value:
                 carry = value
+
             elif carry and col_idx > 0:
                 filled[row_idx][col_idx] = carry
+
     return filled
 
 def _merge_header_rows(header_rows: list[list[str]], num_cols: int) -> list[str]:
+
     header_rows = _decorate_duplicate_header_children(header_rows)
     header_rows = _fill_header_blanks(header_rows)
+
     columns = []
+
     for col_idx in range(num_cols):
+
         pieces = []
+
         for row in header_rows:
-            piece = _clean_header_piece(row[col_idx] if col_idx < len(row) else "")
-            if piece and piece.lower() not in {p.lower() for p in pieces}:
+
+            piece = _clean_header_piece(
+                row[col_idx] if col_idx < len(row) else ""
+            )
+
+            if piece and (
+                not pieces or piece.lower() != pieces[-1].lower()
+            ):
                 pieces.append(piece)
-        columns.append(" - ".join(pieces) if pieces else f"Col_{col_idx}")
+
+        if pieces:
+            columns.append(" - ".join(pieces))
+        else:
+            columns.append(f"Column_{col_idx}")
+
     return columns
+
+def _looks_like_key_value_without_header(rows: list[list[str]]) -> bool:
+    if len(rows) < 2:
+        return False
+    num_cols = max((len(row) for row in rows), default=0)
+    if num_cols != 2:
+        return False
+    populated_rows = [
+        row for row in rows
+        if sum(1 for value in row if str(value).strip()) == 2
+    ]
+    if len(populated_rows) < 2:
+        return False
+    first_left = str(populated_rows[0][0]).strip()
+    first_right = str(populated_rows[0][1]).strip()
+    if not first_left or not first_right:
+        return False
+    first_row_header_like = (
+        re.search(r"[A-Za-z]", first_left)
+        and re.search(r"[A-Za-z]", first_right)
+        and _numeric_density([first_left, first_right]) <= 0.25
+        and not _looks_like_data_row_label(first_left)
+    )
+    right_values = [str(row[1]).strip() for row in populated_rows]
+    right_data_ratio = sum(
+        1 for value in right_values
+        if _numeric_like(value) or _numeric_density([value]) >= 0.35
+    ) / len(right_values)
+    left_text_ratio = sum(
+        1 for row in populated_rows
+        if re.search(r"[A-Za-z]", str(row[0]))
+    ) / len(populated_rows)
+    if first_row_header_like and right_data_ratio >= 0.50:
+        return False
+    return right_data_ratio >= 0.80 and left_text_ratio >= 0.80
 
 def _column_centers_from_grid(grid: list) -> dict[int, float]:
     buckets = {}
@@ -1335,6 +1414,35 @@ def _visual_rows_to_grid(visual_rows: list[list[dict]], columns: list[float]) ->
             med_height = median(l["height"] for l in visual) if visual else 8.0
             is_vertically_tight = gap < med_height * 1.8
 
+        prev_populated = []
+        if raw_rows:
+            prev_populated = [idx for idx, value in enumerate(raw_rows[-1]) if str(value).strip()]
+        populated_subset_prev = bool(populated) and set(populated).issubset(set(prev_populated))
+        has_alpha_fragment = any(re.search(r"[A-Za-z]", value) for value in populated_values)
+        has_dangling_neighbor = any(
+            idx < len(raw_rows[-1])
+            and (
+                re.search(r"[\(\[,;:/-]\s*$", str(raw_rows[-1][idx]).strip())
+                or re.search(r"^[\)\],;:/-]", str(row[idx]).strip())
+            )
+            for idx in populated
+        ) if raw_rows else False
+        short_fragment_row = (
+            populated_values
+            and max(len(str(value).split()) for value in populated_values) <= 3
+            and len(populated) <= max(2, int(len(columns) * 0.40))
+        )
+        no_first_col_wrap = (
+            not first_col_text
+            and is_vertically_tight
+            and populated_subset_prev
+            and (
+                has_alpha_fragment
+                or has_dangling_neighbor
+                or (short_fragment_row and numeric_density < 0.80)
+            )
+        )
+
         # More aggressive continuation for sparse non-numeric rows with tight gap
         is_sparse_non_numeric = (
             len(populated) <= max(2, int(len(columns) * 0.40))
@@ -1346,6 +1454,7 @@ def _visual_rows_to_grid(visual_rows: list[list[dict]], columns: list[float]) ->
             raw_rows
             and (
                 has_first_col_only
+                or no_first_col_wrap
                 or (not first_col_text and is_sparse_continuation and not has_real_row_payload)
                 or (is_sparse_non_numeric and is_vertically_tight)
             )
@@ -1389,6 +1498,111 @@ def _raw_rows_score(raw_rows: list[list[str]]) -> float:
     merged_penalty = merged_penalty / max(len(normalized) - 1, 1)
     return populated_ratio - (ragged_penalty * 0.25) - (merged_penalty * 0.35)
 
+def _first_column_fragment_penalty(df: pd.DataFrame) -> float:
+    if df is None or df.empty or df.shape[1] < 3 or len(df) < 2:
+        return 0.0
+
+    penalties = 0
+    comparisons = max(len(df) - 1, 1)
+    for row_idx in range(len(df) - 1):
+        current_label = _safe_cell_value(df.iloc[row_idx, 0]).strip()
+        next_label = _safe_cell_value(df.iloc[row_idx + 1, 0]).strip()
+        if not current_label or not next_label:
+            continue
+
+        current_payload = [
+            _safe_cell_value(value).strip()
+            for value in df.iloc[row_idx, 1:].tolist()
+            if _safe_cell_value(value).strip()
+        ]
+        next_payload = [
+            _safe_cell_value(value).strip()
+            for value in df.iloc[row_idx + 1, 1:].tolist()
+            if _safe_cell_value(value).strip()
+        ]
+        if _numeric_density(current_payload) < 0.45 or _numeric_density(next_payload) < 0.45:
+            continue
+
+        current_words = len(re.findall(r"[A-Za-z0-9]+", current_label))
+        next_words = len(re.findall(r"[A-Za-z0-9]+", next_label))
+        next_starts_like_fragment = bool(re.match(r"^[a-z)\],;:]", next_label))
+        current_unbalanced = current_label.count("(") > current_label.count(")")
+        if current_words >= 10 and next_words <= 5 and (next_starts_like_fragment or current_unbalanced):
+            penalties += 1
+
+    return penalties / comparisons
+
+def _looks_like_wrapped_text_fragment(value: str) -> bool:
+    value = _safe_cell_value(value).strip()
+    if not value:
+        return False
+    if re.match(r"^[a-z(\[;,]", value):
+        return True
+    words = re.findall(r"[A-Za-z]+", value)
+    if not words:
+        return False
+    connector_endings = {
+        "of", "to", "at", "in", "on", "for", "with", "due", "and", "or",
+        "as", "by", "from", "than",
+    }
+    return (
+        len(words) <= 4
+        and words[-1].lower() in connector_endings
+        and not _looks_like_data_row_label(value)
+    )
+
+def _short_wrapped_cell_fragment(value: str) -> bool:
+    value = _safe_cell_value(value).strip()
+    if not value:
+        return False
+    words = re.findall(r"[A-Za-z]+", value)
+    if len(words) > 5:
+        return False
+    return bool(
+        _looks_like_wrapped_text_fragment(value)
+        or re.match(r"^\d+[\).]\s*", value)
+        or re.search(r"[,;:/-]\s*$", value)
+    )
+
+def _wrapped_single_record_penalty(df: pd.DataFrame) -> float:
+    if df is None or df.empty or df.shape[1] < 3:
+        return 0.0
+    if len(df) < 3 or len(df) > 12 or df.shape[1] > 8:
+        return 0.0
+
+    values = [
+        _safe_cell_value(value).strip()
+        for value in df.values.flatten().tolist()
+        if _safe_cell_value(value).strip()
+    ]
+    if not values or _numeric_density(values) > 0.60:
+        return 0.0
+
+    row_density = _row_density(df)
+    if row_density < 0.45:
+        return 0.0
+
+    first_col_values = [
+        _safe_cell_value(value).strip()
+        for value in df.iloc[1:, 0].tolist()
+        if _safe_cell_value(value).strip()
+    ]
+    if len(first_col_values) < 2:
+        return 0.0
+
+    continuation_ratio = sum(
+        1 for value in first_col_values
+        if _looks_like_wrapped_text_fragment(value)
+    ) / len(first_col_values)
+    if continuation_ratio >= 0.65:
+        return continuation_ratio
+
+    short_fragment_ratio = sum(
+        1 for value in values
+        if _short_wrapped_cell_fragment(value)
+    ) / len(values)
+    return short_fragment_ratio if short_fragment_ratio >= 0.68 else 0.0
+
 def _dataframe_quality_score(df: pd.DataFrame, raw_rows: list[list[str]] | None = None) -> float:
     if df is None or df.empty:
         return -999.0
@@ -1404,7 +1618,7 @@ def _dataframe_quality_score(df: pd.DataFrame, raw_rows: list[list[str]] | None 
     avg_header_len = sum(header_lengths) / max(len(header_lengths), 1)
     long_header_ratio = sum(1 for length in header_lengths if length > 90) / max(cols, 1)
 
-    values = df.astype(str).values.flatten().tolist()
+    values = [str(value) for value in df.values.flatten().tolist()]
     one_word_ratio = sum(1 for value in values if value.strip() and len(value.split()) == 1) / max(
         sum(1 for value in values if value.strip()),
         1,
@@ -1413,6 +1627,8 @@ def _dataframe_quality_score(df: pd.DataFrame, raw_rows: list[list[str]] | None 
     row_bonus = min(rows, 12) / 12.0
     col_bonus = min(cols, 10) / 10.0
     raw_score = _raw_rows_score(raw_rows or [])
+    label_fragment_penalty = _first_column_fragment_penalty(df)
+    wrapped_single_record_penalty = _wrapped_single_record_penalty(df)
 
     return (
         1.0
@@ -1423,6 +1639,8 @@ def _dataframe_quality_score(df: pd.DataFrame, raw_rows: list[list[str]] | None 
         - long_header_ratio * 0.75
         - max(0.0, avg_header_len - 65.0) / 120.0
         - one_word_ratio * 0.08
+        - label_fragment_penalty * 0.30
+        - wrapped_single_record_penalty * 0.65
     )
 
 def _build_enhanced_raw_rows(table_item, doc=None) -> list[list[str]]:
@@ -1435,30 +1653,45 @@ def _build_enhanced_raw_rows(table_item, doc=None) -> list[list[str]]:
         return geometric_rows
     return offset_rows
 
-def _enhance_raw_table(
-    raw_rows: list[list[str]],
-    header_count_hint: int = 0,
-) -> pd.DataFrame:
+def _enhance_raw_table(raw_rows: list[list[str]]) -> pd.DataFrame:
     if not raw_rows:
         return pd.DataFrame()
 
     num_cols = max(len(row) for row in raw_rows)
     normalized_rows = [row + [""] * (num_cols - len(row)) for row in raw_rows]
+    
+    # Strip leading spanning-title rows (1-2 populated cells, very low numeric)
+    while len(normalized_rows) > 2:
+        row = normalized_rows[0]
+        populated = [str(v).strip() for v in row if str(v).strip()]
+        row_fills_all_columns = len(populated) == num_cols
+        single_long_title = (
+            len(populated) == 1
+            and (
+                len(populated[0]) >= 30
+                or re.match(r"^\(?status\b", populated[0].strip(), re.IGNORECASE)
+            )
+        )
+        if (
+            not row_fills_all_columns
+            and (
+                single_long_title
+                or (len(populated) <= 2 and _numeric_density(populated) < 0.10)
+            )
+        ):
+            normalized_rows = normalized_rows[1:]
+        else:
+            break
 
-    if header_count_hint <= 0:
-        while len(normalized_rows) > 2:
-            row = normalized_rows[0]
-            populated = [str(v).strip() for v in row if str(v).strip()]
-            if len(populated) <= 2 and _numeric_density(populated) < 0.10:
-                normalized_rows = normalized_rows[1:]
-            else:
-                break
+    header_count = _detect_header_row_count(normalized_rows)
+    if _looks_like_key_value_without_header(normalized_rows):
+        headers = [f"Col_{idx}" for idx in range(num_cols)]
+        data_rows = [
+            row for row in normalized_rows
+            if _classify_row(row) != "empty"
+        ]
+        return pd.DataFrame(data_rows, columns=headers)
 
-
-    if header_count_hint > 0:
-        header_count = min(header_count_hint, max(1, len(normalized_rows) - 1))
-    else:
-        header_count = _detect_header_row_count(normalized_rows)
     headers = _merge_header_rows(normalized_rows[:header_count], num_cols)
 
     data_rows = []
@@ -1469,7 +1702,14 @@ def _enhance_raw_table(
         if row_type == "section_header":
             # Preserve spanning subheaders: text in col 0, empty in rest
             subheader_row = [""] * num_cols
-            text_parts = [str(v).strip() for v in row if str(v).strip()]
+            text_parts = []
+            seen_parts = set()
+            for value in row:
+                text = str(value).strip()
+                key = text.lower()
+                if text and key not in seen_parts:
+                    text_parts.append(text)
+                    seen_parts.add(key)
             subheader_row[0] = " ".join(text_parts)
             data_rows.append(subheader_row)
             continue
@@ -1522,9 +1762,6 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
     candidates = []
     max_cols = max((len(row) for row in grid), default=0) if grid else 0
 
-
-    grid_header_hint = _grid_header_row_count(table_item)
-
     builders = [
         ("row-first", lambda ti: _build_row_first_raw_rows(ti, doc)),
         ("geometric", _build_geometric_raw_rows),
@@ -1534,16 +1771,16 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
     for label, builder in builders:
         try:
             raw_rows = builder(table_item)
-            enhanced = _enhance_raw_table(raw_rows, header_count_hint=grid_header_hint)
+            enhanced = _enhance_raw_table(raw_rows)
             if enhanced is not None and not enhanced.empty:
-                candidates.append((label, _dataframe_quality_score(enhanced, raw_rows), enhanced))
+                candidates.append((label, _dataframe_quality_score(enhanced, raw_rows), enhanced, len(raw_rows)))
         except Exception as exc:
             print(f"[tables] {label} reconstruction failed; trying fallback: {exc}")
 
     try:
         original = _original_export_table_smart(table_item, doc)
         if original is not None and not original.empty:
-            candidates.append(("original", _dataframe_quality_score(original, None), original))
+            candidates.append(("original", _dataframe_quality_score(original, None), original, len(original) + 1))
     except Exception as exc:
         print(f"[tables] original export failed: {exc}")
 
@@ -1552,6 +1789,17 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
 
     candidates.sort(key=lambda item: item[1], reverse=True)
     best_score = candidates[0][1]
+    best_raw_len = candidates[0][3]
+
+    if candidates[0][0] == "row-first":
+        fuller_candidates = [
+            item for item in candidates[1:]
+            if item[3] > best_raw_len and item[1] >= best_score * 0.82
+        ]
+        if fuller_candidates:
+            fuller_candidates.sort(key=lambda item: (item[3], item[1]), reverse=True)
+            candidates.insert(0, fuller_candidates[0])
+            best_score = candidates[0][1]
 
     # Use pdfplumber if table is dense (>=8 cols) OR current best score is poor (<0.3)
     if max_cols >= 8 or best_score < 0.3:
@@ -1562,25 +1810,20 @@ def export_table_smart(table_item, doc) -> pd.DataFrame:
                 if enhanced is not None and not enhanced.empty:
                     score = _dataframe_quality_score(enhanced, raw_rows)
                     if score > best_score:
-                        candidates.insert(0, ("pdfplumber", score, enhanced))
+                        candidates.insert(0, ("pdfplumber", score, enhanced, len(raw_rows)))
         except Exception as exc:
             print(f"[tables] pdfplumber fallback failed: {exc}")
 
     return candidates[0][2]
 
 def deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    seen, new_cols, ec = {}, [], 0
+    new_cols, ec = [], 0
     for col in df.columns:
         s = str(col).strip()
         if s in ("", "nan", "None"):
             s = f"Col_{ec}"
             ec += 1
-        if s in seen:
-            seen[s] += 1
-            new_cols.append(f"{s}_{seen[s]}")
-        else:
-            seen[s] = 0
-            new_cols.append(s)
+        new_cols.append(s)
     df.columns = new_cols
     return df
 
@@ -1589,8 +1832,8 @@ def fix_split_cell_text(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    for col in df.columns:
-        sample = df[col].astype(str).str.strip()
+    for col_idx in range(df.shape[1]):
+        sample = df.iloc[:, col_idx].map(_safe_cell_value).str.strip()
         non_empty = sample[sample != ""]
         if non_empty.empty:
             continue
@@ -1619,15 +1862,98 @@ def fix_split_cell_text(df: pd.DataFrame) -> pd.DataFrame:
                 val,
             )
             # Fix mid-word space
+            uppercase_join_stops = {
+                "AND", "OR", "OF", "THE", "IN", "ON", "FOR", "TO", "BY", "UT", "NCT",
+            }
             val = re.sub(
                 r'([A-Z]{2,})\s([A-Z]{1,3})(?=\s|$)',
-                lambda m: m.group(1) + m.group(2),
+                lambda m: (
+                    f"{m.group(1)} {m.group(2)}"
+                    if m.group(2).upper() in uppercase_join_stops
+                    else m.group(1) + m.group(2)
+                ),
                 val,
             )
             return val
 
-        df[col] = df[col].apply(repair_cell)
+        df.iloc[:, col_idx] = df.iloc[:, col_idx].apply(repair_cell)
     return df
+
+def _repair_alpha_prefix_numeric_bleed(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or df.shape[1] < 2:
+        return df
+    repaired = df.copy()
+    for col_idx in range(1, repaired.shape[1]):
+        sample = repaired.iloc[:, col_idx].map(_safe_cell_value).str.strip()
+        non_empty = sample[sample != ""]
+        if non_empty.empty:
+            continue
+
+        def numeric_after_prefix(value: str) -> bool:
+            value = str(value).strip()
+            if _numeric_like(value) or _numeric_density([value]) >= 0.60:
+                return True
+            match = re.match(r"^([A-Za-z][A-Za-z\s/&().-]{1,45})\s+([\d,]+(?:\.\d+)?(?:\s*%|\s*[A-Za-z.()/-]+)?)$", value)
+            return bool(match and (_numeric_like(match.group(2)) or _numeric_density([match.group(2)]) >= 0.60))
+
+        numericish_ratio = non_empty.map(numeric_after_prefix).sum() / len(non_empty)
+        if numericish_ratio < 0.65:
+            continue
+
+        for row_pos, value in enumerate(repaired.iloc[:, col_idx].map(_safe_cell_value).tolist()):
+            value = value.strip()
+            match = re.match(
+                r"^([A-Za-z][A-Za-z\s/&().-]{1,45})\s+([\d,]+(?:\.\d+)?(?:\s*%|\s*[A-Za-z.()/-]+)?)$",
+                value,
+            )
+            if not match:
+                continue
+            prefix, numeric_tail = match.group(1).strip(), match.group(2).strip()
+            left_value = _safe_cell_value(repaired.iat[row_pos, col_idx - 1]).strip()
+            if not left_value or _numeric_like(left_value) or not re.search(r"[A-Za-z]", left_value):
+                continue
+            trailing_paren = re.match(r"^(.*?)(\s+\([^)]+\))$", left_value)
+            trailing_unit = re.match(r"^(.*?)(\b[A-Za-z][A-Za-z/-]*\s+\([^)]+\))$", left_value)
+            if trailing_unit and len(prefix.split()) == 1:
+                repaired.iat[row_pos, col_idx - 1] = f"{trailing_unit.group(1).strip()} {prefix} {trailing_unit.group(2)}".strip()
+            elif trailing_paren:
+                repaired.iat[row_pos, col_idx - 1] = f"{trailing_paren.group(1).strip()} {prefix}{trailing_paren.group(2)}".strip()
+            else:
+                repaired.iat[row_pos, col_idx - 1] = f"{left_value} {prefix}".strip()
+            repaired.iat[row_pos, col_idx] = numeric_tail
+    return repaired
+
+def _repair_leaked_next_row_label(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or df.shape[1] < 3:
+        return df
+    repaired = df.copy()
+
+    text_col_idx = 1 if df.shape[1] > 2 else 0
+    text_col = repaired.columns[text_col_idx]
+    data_cols = list(repaired.columns[text_col_idx + 1:])
+    if not data_cols:
+        return repaired
+
+    for pos in range(1, len(repaired)):
+        row_label = str(repaired.iloc[pos, text_col_idx]).strip()
+        prev_label = str(repaired.iloc[pos - 1, text_col_idx]).strip()
+        if not row_label or not prev_label:
+            continue
+        if not re.match(r"^\([^)]+\)$", row_label):
+            continue
+        row_payload = [
+            str(repaired.iloc[pos][col]).strip()
+            for col in data_cols
+            if str(repaired.iloc[pos][col]).strip()
+        ]
+        if not row_payload or _numeric_density(row_payload) < 0.50:
+            continue
+        match = re.match(r"^(.+?\))\s+([A-Z][A-Za-z0-9].+)$", prev_label)
+        if not match:
+            continue
+        repaired.iat[pos - 1, text_col_idx] = match.group(1).strip()
+        repaired.iat[pos, text_col_idx] = f"{match.group(2).strip()} {row_label}".strip()
+    return repaired
 
 
 # Keep the old name as an alias so any existing callers still work.
@@ -1736,6 +2062,41 @@ def _repair_merged_cell_values(df: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(split_rows, columns=cols)
 
+def _repair_single_row_spanning_label(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or df.shape[0] != 1 or df.shape[1] < 3:
+        return df
+
+    first_header = _safe_cell_value(df.columns[0]).strip()
+    first_value = _safe_cell_value(df.iat[0, 0]).strip()
+    if not first_header or not first_value:
+        return df
+    if _numeric_like(first_header) or _numeric_like(first_value):
+        return df
+    if not re.search(r"[A-Za-z]", first_header) or not re.search(r"[A-Za-z]", first_value):
+        return df
+    if not _looks_like_wrapped_text_fragment(first_value):
+        return df
+
+    other_headers = [_safe_cell_value(col).strip() for col in df.columns[1:]]
+    other_values = [_safe_cell_value(value).strip() for value in df.iloc[0, 1:].tolist()]
+    header_numeric_ratio = sum(
+        1 for value in other_headers
+        if _numeric_like(value) or re.search(r"\d", value)
+    ) / max(len(other_headers), 1)
+    value_numeric_ratio = sum(
+        1 for value in other_values
+        if _numeric_like(value) or _numeric_density([value]) >= 0.60
+    ) / max(len(other_values), 1)
+    if header_numeric_ratio < 0.70 or value_numeric_ratio < 0.70:
+        return df
+
+    repaired = df.copy()
+    new_columns = list(repaired.columns)
+    new_columns[0] = _clean_header_piece(f"{first_header} {first_value}")
+    repaired.columns = new_columns
+    repaired.iat[0, 0] = ""
+    return repaired
+
 
 def export_table_to_csv(conv_result, table_idx: int, output_path: str) -> pd.DataFrame:
     doc = conv_result.document
@@ -1745,9 +2106,14 @@ def export_table_to_csv(conv_result, table_idx: int, output_path: str) -> pd.Dat
         df = pd.DataFrame()
     else:
         df = collapse_to_data_columns(df)
+        df = fix_split_cell_text(df)
+        df = _repair_leaked_next_row_label(df)
+        df = _repair_alpha_prefix_numeric_bleed(df)
         df = _repair_merged_cell_values(df)
+        df = _repair_single_row_spanning_label(df)
     
     df = _stringify_dataframe(df)
+    df.columns = make_columns_unique(df.columns)
     df = deduplicate_columns(df)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -1770,6 +2136,11 @@ def _context_text(ctx: dict) -> str:
         for key in ("section_header", "nearest_text", "full_context")
         if str(ctx.get(key, "") or "").strip()
     ).strip()
+
+def _context_table_label(ctx: dict) -> str:
+    text = _context_text(ctx)
+    match = re.search(r"\b(?:table|tab\.?)\s*[:.-]?\s*(\d+(?:\.\d+)*[a-z]?)\b", text, re.IGNORECASE)
+    return match.group(1).lower() if match else ""
 
 def _jaccard(a: set, b: set) -> float:
     if not a and not b:
@@ -1965,8 +2336,19 @@ def _bbox_alignment_ok(a: dict, b: dict) -> tuple[bool, str]:
     a_width = max(a_right - a_left, 1.0)
     b_width = max(b_right - b_left, 1.0)
     width_ratio = min(a_width, b_width) / max(a_width, b_width)
-    ok = left_delta <= 0.08 and right_delta <= 0.08 and width_ratio >= 0.78
-    return ok, f"bbox left={left_delta:.2f}, right={right_delta:.2f}, width={width_ratio:.2f}"
+    overlap_ratio = max(0.0, min(a_right, b_right) - max(a_left, b_left)) / max(min(a_width, b_width), 1.0)
+    strict_ok = left_delta <= 0.08 and right_delta <= 0.08 and width_ratio >= 0.78
+    overlap_ok = (
+        overlap_ratio >= 0.85
+        and width_ratio >= 0.45
+        and left_delta <= 0.20
+        and right_delta <= 0.20
+    )
+    ok = strict_ok or overlap_ok
+    return ok, (
+        f"bbox left={left_delta:.2f}, right={right_delta:.2f}, "
+        f"width={width_ratio:.2f}, overlap={overlap_ratio:.2f}"
+    )
 
 def _vertical_continuity_ok(a: dict, b: dict) -> tuple[bool, str]:
     if a["page"] is None or b["page"] is None:
@@ -2039,6 +2421,21 @@ def _tables_mergeable(a: dict, b: dict) -> tuple[bool, list[str]]:
     failed = [reason for ok, reason in checks if not ok]
     if failed:
         return False, failed
+
+    a_table_label = _context_table_label(a["ctx"])
+    b_table_label = _context_table_label(b["ctx"])
+    if a_table_label and b_table_label and a_table_label != b_table_label:
+        return False, [f"anti-over-merge: distinct table labels {a_table_label} vs {b_table_label}"]
+
+    a_section = _clean_header_piece(a["ctx"].get("section_header", "")).lower()
+    b_section = _clean_header_piece(b["ctx"].get("section_header", "")).lower()
+    if (
+        a_section
+        and b_section
+        and a_section != b_section
+        and _header_similarity(a["columns"], b["columns"]) >= 0.75
+    ):
+        return False, ["anti-over-merge: repeated schema under different section titles"]
 
     # Anti-over-merge: if BOTH tables have real (non-data-like) headers that
     # are very similar, they are likely two DISTINCT tables that happen to share
@@ -2189,8 +2586,12 @@ def merge_and_export(conv_result, chain: list, output_path: str) -> pd.DataFrame
     merged = pd.concat(aligned, ignore_index=True)
     merged = merged.drop_duplicates()
     merged = fix_split_cell_text(merged)
+    merged = _repair_leaked_next_row_label(merged)
+    merged = _repair_alpha_prefix_numeric_bleed(merged)
     merged = _repair_merged_cell_values(merged)
+    merged = _repair_single_row_spanning_label(merged)
     merged = _stringify_dataframe(merged)
+    merged.columns = make_columns_unique(merged.columns)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -2535,7 +2936,6 @@ def run(
 
     return df
 
-# ---------------------------------------------------------------------------
 # 12. Split View Functions
 # ---------------------------------------------------------------------------
 
@@ -2618,6 +3018,7 @@ def group_tables_by_page(conv_result) -> dict:
         page_tables[page_no].append((table_idx, table, table_context))
     
     return page_tables
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
