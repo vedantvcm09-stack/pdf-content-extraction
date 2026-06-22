@@ -4,11 +4,29 @@ import io
 import re
 import json
 import hashlib
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Module logger
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("store")
+if not logger.handlers:
+    _fh = logging.FileHandler(
+        Path(__file__).resolve().parent / "store.log", encoding="utf-8"
+    )
+    _ch = logging.StreamHandler()
+    _fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    _fh.setFormatter(_fmt)
+    _ch.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    logger.addHandler(_ch)
+    logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -84,16 +102,49 @@ def _new_manifest(pdf_id: str, filename: str, stem: str, md5: str) -> dict:
 def load_manifest(pdf_id: str) -> Optional[dict]:
     p = manifest_path(pdf_id)
     if not p.exists():
+        logger.debug(f"[load_manifest] No manifest file at {p}")
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[load_manifest] Failed to parse {p}: {e}")
         return None
 
 
 def save_manifest(manifest: dict) -> None:
     p = manifest_path(manifest["pdf_id"])
     p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    update_search_index(manifest)
+
+def update_search_index(manifest: dict) -> None:
+    """Builds a comprehensive search_index.json for rapid library searching."""
+    pdf_id = manifest["pdf_id"]
+    search_data = {
+        "pdf_id": pdf_id,
+        "filename": manifest.get("filename", ""),
+        "page_count": manifest.get("page_count", 0),
+        "images": manifest.get("images", []),
+        "tables": []
+    }
+    
+    for tbl in manifest.get("tables", []):
+        tbl_data = dict(tbl)
+        csv_fname = tbl.get("vlm_enhanced_filename") or tbl.get("filename")
+        if csv_fname:
+            csv_p = table_path(pdf_id, csv_fname)
+            if csv_p.exists():
+                try:
+                    df = pd.read_csv(csv_p)
+                    # Convert DataFrame to list of dicts, replacing NaNs with empty string
+                    tbl_data["data"] = df.fillna("").to_dict(orient="records")
+                except Exception as e:
+                    logger.warning(f"[update_search_index] Failed to read {csv_p}: {e}")
+                    tbl_data["data"] = []
+        search_data["tables"].append(tbl_data)
+        
+    index_path = extraction_dir(pdf_id) / "search_index.json"
+    index_path.write_text(json.dumps(search_data, ensure_ascii=False), encoding="utf-8")
+    logger.debug(f"[update_search_index] Updated index for {pdf_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +167,7 @@ def register_pdf(pdf_bytes: bytes, filename: str, page_count: int = 0) -> dict:
     sp = source_pdf_path(pdf_id)
     if not sp.exists():
         sp.write_bytes(pdf_bytes)
+        logger.info(f"[register_pdf] Wrote source PDF ({len(pdf_bytes) // 1024} KB) → {sp}")
 
     manifest = load_manifest(pdf_id) or _new_manifest(pdf_id, filename, stem, md5)
     manifest["filename"] = filename
@@ -124,6 +176,7 @@ def register_pdf(pdf_bytes: bytes, filename: str, page_count: int = 0) -> dict:
     if page_count:
         manifest["page_count"] = page_count
     save_manifest(manifest)
+    logger.info(f"[register_pdf] Registered '{filename}' as {pdf_id} ({page_count} pages)")
     return manifest
 
 
@@ -142,6 +195,7 @@ def save_image(
     fname = image_filename(manifest["stem"], idx, page)
     out_path = extraction_dir(pdf_id) / "images" / fname
     out_path.write_bytes(png_bytes)
+    logger.info(f"[save_image] {fname} ({len(png_bytes) // 1024} KB) → {out_path}")
 
     # Upsert by filename
     manifest["images"] = [e for e in manifest["images"] if e["filename"] != fname]
@@ -163,6 +217,7 @@ def save_table(
     page: int,
     section_header: str = "",
     nearest_text: str = "",
+    bbox: list[float] | None = None,
 ) -> str:
     """Persist a table CSV and update manifest. Returns relative filename."""
     manifest = load_manifest(pdf_id)
@@ -172,6 +227,7 @@ def save_table(
     fname = table_filename(manifest["stem"], idx, page)
     out_path = extraction_dir(pdf_id) / "tables" / fname
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info(f"[save_table] {fname} ({df.shape[0]}×{df.shape[1]}) → {out_path}")
 
     manifest["tables"] = [e for e in manifest["tables"] if e["filename"] != fname]
     manifest["tables"].append({
@@ -182,15 +238,95 @@ def save_table(
         "cols": int(df.shape[1]),
         "section_header": section_header or "",
         "nearest_text": nearest_text or "",
+        "bbox": bbox,
     })
     manifest["tables"].sort(key=lambda e: (e["page"], e["idx"]))
     save_manifest(manifest)
     return fname
 
 
+def save_image_vlm_description(pdf_id: str, filename: str, description: str) -> None:
+    """Save generated VLM caption/description for an image and update the manifest."""
+    manifest = load_manifest(pdf_id)
+    if manifest is None:
+        logger.warning(f"[save_image_vlm_description] No manifest for {pdf_id}, skipping.")
+        return
+
+    # Update in manifest
+    updated = False
+    for entry in manifest.get("images", []):
+        if entry["filename"] == filename:
+            entry["vlm_description"] = description
+            updated = True
+            break
+
+    if updated:
+        save_manifest(manifest)
+
+    # Save as text file in summaries/ directory
+    txt_name = f"desc_{Path(filename).stem}.txt"
+    out_path = extraction_dir(pdf_id) / "summaries" / txt_name
+    out_path.write_text(description, encoding="utf-8")
+    logger.info(f"[save_image_vlm_description] {filename} → {out_path} ({len(description)} chars)")
+
+
+def save_table_vlm_summary(pdf_id: str, filename: str, summary: str) -> None:
+    """Save generated VLM summary/explanation for a table and update the manifest."""
+    manifest = load_manifest(pdf_id)
+    if manifest is None:
+        logger.warning(f"[save_table_vlm_summary] No manifest for {pdf_id}, skipping.")
+        return
+
+    # Update in manifest
+    updated = False
+    for entry in manifest.get("tables", []):
+        if entry["filename"] == filename:
+            entry["vlm_summary"] = summary
+            updated = True
+            break
+
+    if updated:
+        save_manifest(manifest)
+
+    # Save as text file in summaries/ directory
+    txt_name = f"desc_{Path(filename).stem}.txt"
+    out_path = extraction_dir(pdf_id) / "summaries" / txt_name
+    out_path.write_text(summary, encoding="utf-8")
+    logger.info(f"[save_table_vlm_summary] {filename} → {out_path} ({len(summary)} chars)")
+
+
+def save_table_vlm_enhanced(pdf_id: str, filename: str, enhanced_df: pd.DataFrame) -> str:
+    """Save the VLM-enhanced table CSV, update the manifest, and return its filename."""
+    manifest = load_manifest(pdf_id)
+    if manifest is None:
+        raise RuntimeError(f"No manifest for pdf_id={pdf_id}")
+
+    stem = Path(filename).stem
+    enhanced_fname = f"{stem}_enhanced.csv"
+    out_path = extraction_dir(pdf_id) / "tables" / enhanced_fname
+    enhanced_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info(
+        f"[save_table_vlm_enhanced] {enhanced_fname} ({enhanced_df.shape[0]}×{enhanced_df.shape[1]}) → {out_path}"
+    )
+
+    # Update in manifest
+    updated = False
+    for entry in manifest.get("tables", []):
+        if entry["filename"] == filename:
+            entry["vlm_enhanced_filename"] = enhanced_fname
+            updated = True
+            break
+
+    if updated:
+        save_manifest(manifest)
+
+    return enhanced_fname
+
+
 # ---------------------------------------------------------------------------
 # Listing / loading
 # ---------------------------------------------------------------------------
+
 
 def list_pdfs() -> list[dict]:
     """Return all manifests sorted by upload time (newest first)."""
@@ -221,3 +357,6 @@ def delete_pdf(pdf_id: str) -> None:
     d = EXTRACTIONS_ROOT / pdf_id
     if d.exists():
         shutil.rmtree(d)
+        logger.info(f"[delete_pdf] Removed extraction directory: {d}")
+    else:
+        logger.warning(f"[delete_pdf] Directory not found: {d}")

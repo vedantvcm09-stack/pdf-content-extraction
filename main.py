@@ -2,6 +2,24 @@
 # 0. Imports
 # ---------------------------------------------------------------------------
 
+# region Warning Suppression
+import warnings
+import logging
+
+# Suppress Hugging Face transformers/lazy import warnings about __path__
+warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*")
+warnings.filterwarnings("ignore", message=".*Behavior may be different and this alias.*")
+
+class TransformersWarningFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Accessing `__path__` from" in msg or "this alias will be removed" in msg:
+            return False
+        return True
+
+logging.getLogger("transformers").addFilter(TransformersWarningFilter())
+# endregion
+
 import io
 import re
 import difflib
@@ -2564,7 +2582,14 @@ def _align_fragment_to_base(base_sig: dict, frag_sig: dict) -> pd.DataFrame:
     except ValueError:
         return pd.DataFrame(columns=base_cols)
 
-def merge_and_export(conv_result, chain: list, output_path: str) -> pd.DataFrame:
+def merge_and_export(
+    conv_result,
+    chain: list,
+    output_path: str,
+    vlm_model: str = None,
+    ollama_url: str = None,
+    pdf_path: str = None,
+) -> pd.DataFrame:
     doc = conv_result.document
     chain = sorted(chain, key=lambda c: c["table_idx"])
     if not chain:
@@ -2592,6 +2617,43 @@ def merge_and_export(conv_result, chain: list, output_path: str) -> pd.DataFrame
     merged = _repair_single_row_spanning_label(merged)
     merged = _stringify_dataframe(merged)
     merged.columns = make_columns_unique(merged.columns)
+
+    # Hybrid VLM Refinement
+    if vlm_model and ollama_url and pdf_path:
+        image_bytes_list = []
+        for ctx in chain:
+            table_idx = ctx["table_idx"]
+            page_no = 0
+            try:
+                tbl = doc.tables[table_idx]
+                if tbl.prov:
+                    page_no = tbl.prov[0].page_no
+            except Exception:
+                pass
+            if page_no > 0:
+                try:
+                    tbl_item = doc.tables[table_idx]
+                    crop_bytes = crop_table_to_image_bytes(pdf_path, page_no, tbl_item)
+                    if crop_bytes:
+                        image_bytes_list.append(crop_bytes)
+                except Exception as crop_err:
+                    print(f"[vlm-merge] Failed to crop table {table_idx + 1} on page {page_no}: {crop_err}")
+
+        if image_bytes_list:
+            try:
+                import vlm_helper
+                draft_csv = merged.to_csv(index=False)
+                print(f"[vlm-merge] Sending {len(image_bytes_list)} table crops and draft CSV to VLM ({vlm_model}) for refinement...")
+                refined_csv_str = vlm_helper.refine_merged_table(draft_csv, image_bytes_list, vlm_model, ollama_url)
+                if refined_csv_str:
+                    import io as io_mod
+                    refined_df = pd.read_csv(io_mod.StringIO(refined_csv_str))
+                    refined_df = _stringify_dataframe(refined_df)
+                    refined_df.columns = make_columns_unique(refined_df.columns)
+                    merged = refined_df
+                    print("[vlm-merge] VLM successfully refined the merged table structure!")
+            except Exception as vlm_err:
+                print(f"[vlm-merge] VLM refinement failed, falling back to heuristic merge: {vlm_err}")
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -2794,6 +2856,8 @@ def run(
     output_dir: str = None,
     image_scale: float = DEFAULT_IMAGE_SCALE,
     accurate: bool = False,
+    vlm_model: str = None,
+    ollama_url: str = None,
 ) -> pd.DataFrame | None:
     SEP = "-" * 65
 
@@ -2924,7 +2988,7 @@ def run(
         ids = [c["table_idx"] + 1 for c in chain]
         print(f"\n [CROSS-PAGE TABLE DETECTED]")
         print(f" Merging {len(chain)} fragments — Tables {ids} -> {output_csv}")
-        df = merge_and_export(conv_result, chain, output_csv)
+        df = merge_and_export(conv_result, chain, output_csv, vlm_model=vlm_model, ollama_url=ollama_url, pdf_path=pdf_path)
     else:
         print(f"\n Exporting Table {best_ctx['table_idx'] + 1} -> {output_csv}")
         df = export_table_to_csv(conv_result, best_ctx["table_idx"], output_csv)
@@ -2960,6 +3024,28 @@ def render_pdf_pages_as_images(pdf_path: str, scale: float = 2.0) -> list:
     
     doc.close()
     return page_images
+
+
+def crop_table_to_image_bytes(pdf_path: str, page_no: int, table_item, scale: float = 3.0) -> bytes | None:
+    """
+    Renders the page and crops out only the bounding box area of the table using PyMuPDF.
+    Returns raw PNG bytes or None if failing.
+    """
+    bbox = _table_cell_union_bbox(table_item)
+    if not bbox:
+        return None
+    try:
+        doc = pymupdf.open(pdf_path)
+        page = doc[page_no - 1]
+        rect = pymupdf.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+        pix = page.get_pixmap(clip=rect, matrix=pymupdf.Matrix(scale, scale))
+        png_bytes = pix.tobytes("png")
+        doc.close()
+        return png_bytes
+    except Exception as e:
+        print(f"[tables] Failed to visually crop table: {e}")
+        return None
+
 
 def group_figures_by_page(conv_result) -> dict:
     """
