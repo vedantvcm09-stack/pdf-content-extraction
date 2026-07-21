@@ -1394,7 +1394,7 @@ if st.session_state.active_action == "csv" and uploaded_file is not None:
 
 st.divider()
 st.markdown(
-    "Docling by IBM Research · "
-    "No LLMs · No external APIs",
+    "Built with Docling by Ashoka · "
+    "Local-first processing · No external providers · No external APIs",
     unsafe_allow_html=True,
 )
